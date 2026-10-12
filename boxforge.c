@@ -4,9 +4,10 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sched.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <signal.h>
-#include <sys/stat.h> // <-- WEEK 8: Folder banane ke liye zaroori
 
 #define STACK_SIZE (1024 * 1024)
 static char child_stack[STACK_SIZE];
@@ -14,49 +15,28 @@ static char child_stack[STACK_SIZE];
 pid_t global_child_pid = -1;
 int pipe_fd[2];
 
-void handle_signal(int sig) {
-    printf("\n[BoxForge] Warning: Signal %d received! Cleaning up...\n", sig);
-    if (global_child_pid > 0) kill(global_child_pid, SIGTERM);
-}
-
-// --- WEEK 8: CGROUP HELPER FUNCTIONS ---
-void write_cg_file(const char *path, const char *value) {
+void write_file(const char *path, const char *value) {
     FILE *f = fopen(path, "w");
     if (f) {
         fprintf(f, "%s", value);
         fclose(f);
-    } else {
-        perror("Cgroup write failed (Are you running with sudo?)");
     }
 }
 
-void setup_cgroup() {
-    printf("Container: Setting up Cgroups (RAM Limit: 50MB)...\n");
-    
-    // Linux kernel ke virtual cgroup folder mein apna ek naya folder banao
-    mkdir("/sys/fs/cgroup/boxforge", 0755);
-    
-    // 50 MB limit set karo (50000000 bytes)
-    write_cg_file("/sys/fs/cgroup/boxforge/memory.max", "50000000"); 
-    
-    // Kernel ko batao ki humare current process (container) par yeh limit lagani hai
-    char pid[32];
-    sprintf(pid, "%d", getpid());
-    write_cg_file("/sys/fs/cgroup/boxforge/cgroup.procs", pid);
+void handle_signal(int sig) {
+    if (global_child_pid > 0) {
+        kill(global_child_pid, SIGTERM);
+    }
 }
-// ---------------------------------------
 
 int child_main(void *arg) {
     char **argv = (char **)arg;
-    
+    usleep(50000);
+
     close(pipe_fd[0]);
     dup2(pipe_fd[1], STDOUT_FILENO);
     dup2(pipe_fd[1], STDERR_FILENO);
-
-    // --- WEEK 8: CALL CGROUP SETUP ---
-    // Isolation start hone se thik pehle RAM limit set karo
-    setup_cgroup();
-    // ---------------------------------
+    close(pipe_fd[1]);
 
     sethostname("boxforge-os", 11);
     clearenv();
@@ -64,10 +44,25 @@ int child_main(void *arg) {
     setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
     setenv("HOME", "/root", 1);
 
-    if (chroot("rootfs") != 0) return -1;
-    chdir("/"); 
+    // --- WEEK 9: OVERLAYFS MOUNT ---
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
-    if (execvp(argv[1], &argv[1]) == -1) return -1;
+    if (mount("overlay", "merged", "overlay", 0, "lowerdir=rootfs,upperdir=upper,workdir=work") != 0) {
+        perror("OverlayFS mount failed");
+        return -1;
+    }
+
+    if (chroot("merged") != 0 || chdir("/") != 0) {
+        perror("chroot/chdir failed");
+        return -1;
+    }
+
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {}
+
+    if (execvp(argv[0], argv) == -1) {
+        perror("execvp failed");
+        return -1;
+    }
     return 0;
 }
 
@@ -77,39 +72,43 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("[BoxForge] Starting container with Memory Limits...\n");
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
-    signal(SIGINT, handle_signal);  
-    signal(SIGTERM, handle_signal); 
+    // --- WEEK 12: AUTOMATED SETUP ---
+    umount("merged");
+    system("rm -rf upper work merged");
+    mkdir("upper", 0755);
+    mkdir("work", 0755);
+    mkdir("merged", 0755);
 
-    if (pipe(pipe_fd) == -1) exit(EXIT_FAILURE);
+    if (pipe(pipe_fd) == -1) {
+        exit(EXIT_FAILURE);
+    }
 
-    int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD;
-    pid_t child_pid = clone(child_main, child_stack + STACK_SIZE, flags, argv);
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET | SIGCHLD;
+    pid_t child_pid = clone(child_main, child_stack + STACK_SIZE, flags, &argv[1]);
+    global_child_pid = child_pid;
 
-    if (child_pid == -1) exit(EXIT_FAILURE);
-    global_child_pid = child_pid; 
+    mkdir("/sys/fs/cgroup/boxforge", 0755);
+    write_file("/sys/fs/cgroup/boxforge/memory.max", "50000000");
+    write_file("/sys/fs/cgroup/boxforge/memory.swap.max", "0");
+    char pid_str[32];
+    sprintf(pid_str, "%d", child_pid);
+    write_file("/sys/fs/cgroup/boxforge/cgroup.procs", pid_str);
 
     close(pipe_fd[1]);
-    
     char buffer[256];
     int bytes_read;
-    printf("[BoxForge] Capturing container logs:\n");
-    printf("------------------------------------\n");
-    
     while ((bytes_read = read(pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) {
         buffer[bytes_read] = '\0';
-        printf("[LOG] %s", buffer);
     }
-    printf("------------------------------------\n");
 
+    // --- WEEK 11: TEARDOWN & CLEANUP ---
     waitpid(child_pid, NULL, 0);
-    
-    // --- WEEK 8: CLEANUP CGROUP ---
-    // Container band hone ke baad cgroup folder delete kar do
+    umount("merged");
     rmdir("/sys/fs/cgroup/boxforge");
-    // ------------------------------
-    
-    printf("[BoxForge] Container successfully exited.\n");
+
+    printf("[BoxForge Manager] Container stopped. Resources cleaned up successfully. Exiting cleanly.\n");
     return 0;
 }
